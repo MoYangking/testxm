@@ -7,7 +7,7 @@ if [ "$USER_ID" -ne 0 ]; then
     useradd --shell /bin/sh -u $USER_ID -o -c "" -m user
     usermod -a -G root user
     export HOME=/home/user
-    exec /usr/sbin/gosu user /app/bin/Lagrange.OneBot "$@"
+    exec /usr/sbin/gosu user /app/dotnet/bin/Lagrange.OneBot "$@"
 else
-    exec /app/bin/Lagrange.OneBot "$@"
+    exec /app/dotnet/bin/Lagrange.OneBot "$@"
 fi
