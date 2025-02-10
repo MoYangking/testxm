@@ -1,22 +1,18 @@
-# 使用多阶段构建 .NET 项目
-FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:9.0-bookworm-slim AS build-env
-
-WORKDIR /root/build
+# 第一阶段：构建 .NET 项目
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:9.0-bookworm-slim AS dotnet-build
 ARG TARGETARCH
+WORKDIR /build
 
-COPY c /root/build
+# 只复制 C# 项目目录
+COPY ./c ./c
+RUN dotnet publish -p:DebugType="none" -a $TARGETARCH -f "net9.0" -o "/out" "./c/Lagrange.OneBot"
 
-RUN dotnet publish -p:DebugType="none" -a $TARGETARCH -f "net9.0" -o "/root/out" "Lagrange.OneBot"
+# 第二阶段：构建 Python 基础镜像
+FROM python:3.10-slim AS python-base
+WORKDIR /AstrBot
 
-# 运行环境
-FROM python:3.10-slim
-
-WORKDIR /app
-
-# 安装 Supervisor
+# 安装 Python 项目依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gosu \
-    supervisor \
     gcc \
     build-essential \
     python3-dev \
@@ -25,27 +21,66 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# 复制 .NET 项目
-COPY --from=build-env /root/out /app/dotnet/bin
-COPY c/Lagrange.OneBot/Resources/docker-entrypoint.sh /app/dotnet/bin/docker-entrypoint.sh
+# 复制 Python 项目文件
+COPY ./python/requirements.txt .
+COPY ./python/main.py .
+RUN pip install --no-cache-dir -r requirements.txt socksio wechatpy cryptography
 
-# 复制 Python 项目
-COPY python /app/python
+# 第三阶段：最终运行时镜像
+FROM mcr.microsoft.com/dotnet/runtime:9.0-bookworm-slim
 
-# 赋予执行权限
-RUN chmod +x /app/dotnet/bin/docker-entrypoint.sh
+# 安装 Python 运行时和依赖
+RUN apt-get update && \
+    apt-get install -y \
+    python3.10 \
+    python3-pip \
+    gosu \
+    && rm -rf /var/lib/apt/lists/*
 
-# 安装 Python 依赖
-RUN python -m venv /app/python/venv && \
-    /app/python/venv/bin/pip install --upgrade pip && \
-    /app/python/venv/bin/pip install -r /app/python/requirements.txt --no-cache-dir && \
-    /app/python/venv/bin/pip install socksio wechatpy cryptography --no-cache-dir
+# 设置工作目录结构
+WORKDIR /app
+RUN mkdir -p /app/c/bin /app/python
 
-# 复制 supervisord 配置
-COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+# 从构建阶段复制文件
+COPY --from=dotnet-build /out /app/c/bin
+COPY --from=python-base /AstrBot /app/python
+COPY ./c/Lagrange.OneBot/Resources/docker-entrypoint.sh /app/c/bin/
+
+# 设置入口点脚本和权限
+RUN chmod +x /app/c/bin/docker-entrypoint.sh
+
+# 安装进程管理工具
+RUN apt-get update && \
+    apt-get install -y supervisor && \
+    rm -rf /var/lib/apt/lists/*
+
+# 配置 Supervisor
+RUN mkdir -p /var/log/supervisor
+COPY <<EOF /etc/supervisor/conf.d/supervisord.conf
+[supervisord]
+nodaemon=true
+logfile=/var/log/supervisor/supervisord.log
+
+[program:dotnet-app]
+command=/app/c/bin/docker-entrypoint.sh
+directory=/app/c/bin
+autostart=true
+autorestart=true
+
+[program:python-app]
+command=python3 /app/python/main.py
+directory=/app/python
+autostart=true
+autorestart=true
+EOF
+
+# 设置非特权用户
+RUN groupadd -r appuser && useradd -r -g appuser appuser && \
+    chown -R appuser:appuser /app /var/log/supervisor
 
 # 暴露端口
 EXPOSE 6185 6186
 
-# 使用 Supervisor 管理进程
+# 启动服务
+USER appuser
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
