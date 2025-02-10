@@ -1,59 +1,51 @@
-# -------------------------
-# 阶段1：构建 .NET 应用
-# -------------------------
+# 使用多阶段构建 .NET 项目
 FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:9.0-bookworm-slim AS build-env
+
 WORKDIR /root/build
 ARG TARGETARCH
 
-# 将 .NET 项目（现位于 c 目录）复制进来
-COPY c /root/build/c
+COPY c /root/build
 
-# 执行发布，注意调整项目路径（这里假定项目仍名为 Lagrange.OneBot）
-RUN dotnet publish -p:DebugType="none" -a $TARGETARCH -f "net9.0" -o "/root/out" /root/build/c/Lagrange.OneBot
+RUN dotnet publish -p:DebugType="none" -a $TARGETARCH -f "net9.0" -o "/root/out" "Lagrange.OneBot"
 
-# -------------------------
-# 阶段2：构建最终镜像（包含 .NET runtime 和 Python 环境）
-# -------------------------
-FROM mcr.microsoft.com/dotnet/runtime:9.0-bookworm-slim
+# 运行环境
+FROM python:3.10-slim
+
 WORKDIR /app
 
-# 复制 .NET 应用的发布输出和 docker-entrypoint 脚本
-COPY --from=build-env /root/out /app/dotnet/bin
-COPY c/Lagrange.OneBot/Resources/docker-entrypoint.sh /app/dotnet/bin/docker-entrypoint.sh
-RUN chmod +x /app/dotnet/bin/docker-entrypoint.sh
-
-# 安装系统依赖：gosu、gcc、build-essential 以及 Python 环境和相关依赖
+# 安装 Supervisor
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gosu \
+    supervisor \
     gcc \
     build-essential \
-    python3 \
-    python3-pip \
     python3-dev \
     libffi-dev \
-    libssl-dev && \
-    # 建立 python 的软链接，方便使用 python 命令
-    ln -s /usr/bin/python3 /usr/bin/python && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    libssl-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-# 将 Python 项目复制到镜像中（假定目录为 python）
+# 复制 .NET 项目
+COPY --from=build-env /root/out /app/dotnet/bin
+COPY c/Lagrange.OneBot/Resources/docker-entrypoint.sh /app/dotnet/bin/docker-entrypoint.sh
+
+# 复制 Python 项目
 COPY python /app/python
 
-# 安装 Python 包，同时添加 --break-system-packages 以避免 “externally-managed-environment” 错误
-RUN python -m pip install --upgrade pip --break-system-packages && \
-    python -m pip install -r /app/python/requirements.txt --no-cache-dir --break-system-packages && \
-    python -m pip install socksio wechatpy cryptography --no-cache-dir --break-system-packages
+# 赋予执行权限
+RUN chmod +x /app/dotnet/bin/docker-entrypoint.sh
 
-# 暴露 Python 服务使用的端口（根据原 Dockerfile 设置）
+# 安装 Python 依赖
+RUN python -m venv /app/python/venv && \
+    /app/python/venv/bin/pip install --upgrade pip && \
+    /app/python/venv/bin/pip install -r /app/python/requirements.txt --no-cache-dir && \
+    /app/python/venv/bin/pip install socksio wechatpy cryptography --no-cache-dir
+
+# 复制 supervisord 配置
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+# 暴露端口
 EXPOSE 6185 6186
 
-# 构造启动脚本，同时启动 .NET 服务和 Python 服务
-RUN printf '#!/bin/sh\n\n'\
-'echo "Starting .NET service..."\n'\
-'/app/dotnet/bin/docker-entrypoint.sh &\n\n'\
-'echo "Starting Python service..."\n'\
-'cd /app/python\n'\
-'exec python main.py\n' > /app/start.sh && chmod +x /app/start.sh
-
-# 设置容器启动时执行该启动脚本
-ENTRYPOINT ["/app/start.sh"]
+# 使用 Supervisor 管理进程
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
