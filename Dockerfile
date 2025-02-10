@@ -1,86 +1,87 @@
-# 第一阶段：构建 .NET 项目
-FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:9.0-bookworm-slim AS dotnet-build
+###############################
+# 第一阶段：构建 .NET 程序
+###############################
+# 使用 .NET SDK 构建环境（支持多平台构建）
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:9.0-bookworm-slim AS build-dotnet
+WORKDIR /root/build
+# 如果需要针对目标架构编译，可使用 ARG TARGETARCH
 ARG TARGETARCH
-WORKDIR /build
 
-# 只复制 C# 项目目录
-COPY ./c ./c
-RUN dotnet publish -p:DebugType="none" -a $TARGETARCH -f "net9.0" -o "/out" "./c/Lagrange.OneBot"
+# 将 c 目录下的 .NET 项目复制到构建目录中
+COPY c/ ./
 
-# 第二阶段：构建 Python 基础镜像
-FROM python:3.10-slim AS python-base
-WORKDIR /AstrBot
+# 执行发布命令，将 Lagrange.OneBot 项目编译并发布到 /root/out 目录
+RUN dotnet publish -p:DebugType="none" -a $TARGETARCH -f "net9.0" -o /root/out Lagrange.OneBot
 
-# 安装 Python 项目依赖
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    build-essential \
-    python3-dev \
-    libffi-dev \
-    libssl-dev \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+###############################
+# 第二阶段：构建最终镜像（合并 .NET 与 Python 环境）
+###############################
+# 这里以 python:3.10-slim 作为基础镜像
+FROM python:3.10-slim
 
-# 复制 Python 项目文件
-COPY ./python/requirements.txt .
-COPY ./python/main.py .
-RUN pip install --no-cache-dir -r requirements.txt socksio wechatpy cryptography
-
-# 第三阶段：最终运行时镜像
-FROM mcr.microsoft.com/dotnet/runtime:9.0-bookworm-slim
-
-# 安装 Python 运行时和依赖
+# 安装所需工具、Microsoft 的 apt 源、.NET 运行时、supervisor 以及构建 Python 所需依赖
 RUN apt-get update && \
-    apt-get install -y \
-    python3.10 \
-    python3-pip \
-    gosu \
-    && rm -rf /var/lib/apt/lists/*
-
-# 设置工作目录结构
-WORKDIR /app
-RUN mkdir -p /app/c/bin /app/python
-
-# 从构建阶段复制文件
-COPY --from=dotnet-build /out /app/c/bin
-COPY --from=python-base /AstrBot /app/python
-COPY ./c/Lagrange.OneBot/Resources/docker-entrypoint.sh /app/c/bin/
-
-# 设置入口点脚本和权限
-RUN chmod +x /app/c/bin/docker-entrypoint.sh
-
-# 安装进程管理工具
-RUN apt-get update && \
-    apt-get install -y supervisor && \
+    apt-get install -y wget apt-transport-https gnupg ca-certificates && \
+    wget https://packages.microsoft.com/config/debian/11/packages-microsoft-prod.deb && \
+    dpkg -i packages-microsoft-prod.deb && \
+    rm packages-microsoft-prod.deb && \
+    apt-get update && \
+    apt-get install -y dotnet-runtime-9.0 supervisor gosu gcc build-essential python3-dev libffi-dev libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# 配置 Supervisor
-RUN mkdir -p /var/log/supervisor
-COPY <<EOF /etc/supervisor/conf.d/supervisord.conf
-[supervisord]
-nodaemon=true
-logfile=/var/log/supervisor/supervisord.log
+###############################
+# 复制 .NET 应用文件
+###############################
+# 为 .NET 应用设定工作目录（这里选择 /app，可根据需要调整）
+WORKDIR /app
+# 从第一阶段复制发布后的 .NET 程序到 /app/bin 目录
+COPY --from=build-dotnet /root/out /app/bin
+# 同时复制 docker-entrypoint.sh（确保此脚本在 c/Lagrange.OneBot/Resources/ 目录下）
+COPY c/Lagrange.OneBot/Resources/docker-entrypoint.sh /app/bin/docker-entrypoint.sh
+# 添加执行权限
+RUN chmod +x /app/bin/docker-entrypoint.sh
 
-[program:dotnet-app]
-command=/app/c/bin/docker-entrypoint.sh
-directory=/app/c/bin
-autostart=true
-autorestart=true
+###############################
+# 安装 Python 应用
+###############################
+# 设置 Python 工作目录
+WORKDIR /AstrBot
+# 将 python 目录下的所有文件复制到容器内 /AstrBot 目录
+COPY python/ /AstrBot/
+# 升级 pip 并安装 requirements.txt 中的依赖（无缓存安装），以及额外依赖 socksio、wechatpy、cryptography
+RUN python -m pip install --upgrade pip && \
+    pip install -r requirements.txt --no-cache-dir && \
+    pip install socksio wechatpy cryptography --no-cache-dir
 
-[program:python-app]
-command=python3 /app/python/main.py
-directory=/app/python
-autostart=true
-autorestart=true
-EOF
+# 暴露 Python 应用监听的端口
+EXPOSE 6185
+EXPOSE 6186
 
-# 设置非特权用户
-RUN groupadd -r appuser && useradd -r -g appuser appuser && \
-    chown -R appuser:appuser /app /var/log/supervisor
+###############################
+# 添加 supervisord 配置文件
+###############################
+# 下面的配置定义了两个进程：
+#   - [program:dotnet] 启动 .NET 发行版中的 docker-entrypoint.sh（一般会启动 .NET 应用）
+#   - [program:python] 启动 Python 应用，运行 main.py
+RUN echo "[supervisord]" > /etc/supervisord.conf && \
+    echo "nodaemon=true" >> /etc/supervisord.conf && \
+    echo "" >> /etc/supervisord.conf && \
+    echo "[program:dotnet]" >> /etc/supervisord.conf && \
+    echo "command=/app/bin/docker-entrypoint.sh" >> /etc/supervisord.conf && \
+    echo "autostart=true" >> /etc/supervisord.conf && \
+    echo "autorestart=true" >> /etc/supervisord.conf && \
+    echo "stdout_logfile=/var/log/dotnet.out.log" >> /etc/supervisord.conf && \
+    echo "stderr_logfile=/var/log/dotnet.err.log" >> /etc/supervisord.conf && \
+    echo "" >> /etc/supervisord.conf && \
+    echo "[program:python]" >> /etc/supervisord.conf && \
+    echo "command=python /AstrBot/main.py" >> /etc/supervisord.conf && \
+    echo "directory=/AstrBot" >> /etc/supervisord.conf && \
+    echo "autostart=true" >> /etc/supervisord.conf && \
+    echo "autorestart=true" >> /etc/supervisord.conf && \
+    echo "stdout_logfile=/var/log/python.out.log" >> /etc/supervisord.conf && \
+    echo "stderr_logfile=/var/log/python.err.log" >> /etc/supervisord.conf
 
-# 暴露端口
-EXPOSE 6185 6186
-
-# 启动服务
-USER appuser
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
+###############################
+# 启动 supervisord 作为容器入口进程
+###############################
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]
