@@ -65,21 +65,29 @@ EXPOSE 6186
 #   - [program:python] 启动 Python 应用，运行 main.py
 RUN echo "[supervisord]" > /etc/supervisord.conf && \
     echo "nodaemon=true" >> /etc/supervisord.conf && \
+    echo "logfile=/dev/stdout" >> /etc/supervisord.conf && \
+    echo "logfile_maxbytes=0" >> /etc/supervisord.conf && \
+    echo "loglevel=info" >> /etc/supervisord.conf && \
     echo "" >> /etc/supervisord.conf && \
     echo "[program:dotnet]" >> /etc/supervisord.conf && \
     echo "command=/app/bin/docker-entrypoint.sh" >> /etc/supervisord.conf && \
     echo "autostart=true" >> /etc/supervisord.conf && \
     echo "autorestart=true" >> /etc/supervisord.conf && \
-    echo "stdout_logfile=/var/log/dotnet.out.log" >> /etc/supervisord.conf && \
-    echo "stderr_logfile=/var/log/dotnet.err.log" >> /etc/supervisord.conf && \
+    echo "stdout_logfile=/dev/stdout" >> /etc/supervisord.conf && \
+    echo "stdout_logfile_maxbytes=0" >> /etc/supervisord.conf && \
+    echo "stderr_logfile=/dev/stderr" >> /etc/supervisord.conf && \
+    echo "stderr_logfile_maxbytes=0" >> /etc/supervisord.conf && \
     echo "" >> /etc/supervisord.conf && \
     echo "[program:python]" >> /etc/supervisord.conf && \
     echo "command=python /AstrBot/main.py" >> /etc/supervisord.conf && \
     echo "directory=/AstrBot" >> /etc/supervisord.conf && \
     echo "autostart=true" >> /etc/supervisord.conf && \
     echo "autorestart=true" >> /etc/supervisord.conf && \
-    echo "stdout_logfile=/var/log/python.out.log" >> /etc/supervisord.conf && \
-    echo "stderr_logfile=/var/log/python.err.log" >> /etc/supervisord.conf
+    echo "stdout_logfile=/dev/stdout" >> /etc/supervisord.conf && \
+    echo "stdout_logfile_maxbytes=0" >> /etc/supervisord.conf && \
+    echo "stderr_logfile=/dev/stderr" >> /etc/supervisord.conf && \
+    echo "stderr_logfile_maxbytes=0" >> /etc/supervisord.conf
+
 
 ###############################
 # 启动 supervisord 作为容器入口进程
