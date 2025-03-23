@@ -1,4 +1,4 @@
-'''
+"""
 MIT License
 
 Copyright (c) 2021 Lxns-Network
@@ -20,21 +20,32 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-'''
+"""
 
 import base64
 import json
 import os
+import uuid
 import typing as T
 from enum import Enum
 from pydantic.v1 import BaseModel
+from astrbot.core.utils.io import download_image_by_url, file_to_base64
+
 
 class ComponentType(Enum):
-    Plain = "Plain"
-    Face = "Face"
-    Record = "Record"
-    Video = "Video"
-    At = "At"
+    Plain = "Plain"  # 纯文本消息
+    Face = "Face"  # QQ表情
+    Record = "Record"  # 语音
+    Video = "Video"  # 视频
+    At = "At"  # At
+    Node = "Node"  # 转发消息的一个节点
+    Nodes = "Nodes"  # 转发消息的多个节点
+    Poke = "Poke"  # QQ 戳一戳
+    Image = "Image"  # 图片
+    Reply = "Reply"  # 回复
+    Forward = "Forward"  # 转发消息
+    File = "File"  # 文件
+
     RPS = "RPS"  # TODO
     Dice = "Dice"  # TODO
     Shake = "Shake"  # TODO
@@ -43,18 +54,12 @@ class ComponentType(Enum):
     Contact = "Contact"  # TODO
     Location = "Location"  # TODO
     Music = "Music"
-    Image = "Image"
-    Reply = "Reply"
     RedBag = "RedBag"
-    Poke = "Poke"
-    Forward = "Forward"
-    Node = "Node"
     Xml = "Xml"
     Json = "Json"
     CardImage = "CardImage"
     TTS = "TTS"
     Unknown = "Unknown"
-    File = "File"
 
 
 class BaseMessageComponent(BaseModel):
@@ -69,25 +74,26 @@ class BaseMessageComponent(BaseModel):
                 k = "type"
             if isinstance(v, bool):
                 v = 1 if v else 0
-            output += ",%s=%s" % (k, str(v).replace("&", "&amp;") \
-                                  .replace(",", "&#44;") \
-                                  .replace("[", "&#91;") \
-                                  .replace("]", "&#93;"))
+            output += ",%s=%s" % (
+                k,
+                str(v)
+                .replace("&", "&amp;")
+                .replace(",", "&#44;")
+                .replace("[", "&#91;")
+                .replace("]", "&#93;"),
+            )
         output += "]"
         return output
 
     def toDict(self):
-        data = dict()
+        data = {}
         for k, v in self.__dict__.items():
             if k == "type" or v is None:
                 continue
             if k == "_type":
                 k = "type"
             data[k] = v
-        return {
-            "type": self.type.lower(),
-            "data": data
-        }
+        return {"type": self.type.lower(), "data": data}
 
 
 class Plain(BaseMessageComponent):
@@ -101,9 +107,9 @@ class Plain(BaseMessageComponent):
     def toString(self):  # 没有 [CQ:plain] 这种东西，所以直接导出纯文本
         if not self.convert:
             return self.text
-        return self.text.replace("&", "&amp;") \
-            .replace("[", "&#91;") \
-            .replace("]", "&#93;")
+        return (
+            self.text.replace("&", "&amp;").replace("[", "&#91;").replace("]", "&#93;")
+        )
 
 
 class Face(BaseMessageComponent):
@@ -141,6 +147,51 @@ class Record(BaseMessageComponent):
         if url.startswith("http://") or url.startswith("https://"):
             return Record(file=url, **_)
         raise Exception("not a valid url")
+
+    async def convert_to_file_path(self) -> str:
+        """将这个语音统一转换为本地文件路径。这个方法避免了手动判断语音数据类型，直接返回语音数据的本地路径（如果是网络 URL, 则会自动进行下载）。
+
+        Returns:
+            str: 语音的本地路径，以绝对路径表示。
+        """
+        if self.file and self.file.startswith("file:///"):
+            file_path = self.file[8:]
+            return file_path
+        elif self.file and self.file.startswith("http"):
+            file_path = await download_image_by_url(self.file)
+            return os.path.abspath(file_path)
+        elif self.file and self.file.startswith("base64://"):
+            bs64_data = self.file.removeprefix("base64://")
+            image_bytes = base64.b64decode(bs64_data)
+            file_path = f"data/temp/{uuid.uuid4()}.jpg"
+            with open(file_path, "wb") as f:
+                f.write(image_bytes)
+            return os.path.abspath(file_path)
+        elif os.path.exists(self.file):
+            file_path = self.file
+            return os.path.abspath(file_path)
+        else:
+            raise Exception(f"not a valid file: {self.file}")
+
+    async def convert_to_base64(self) -> str:
+        """将语音统一转换为 base64 编码。这个方法避免了手动判断语音数据类型，直接返回语音数据的 base64 编码。
+
+        Returns:
+            str: 语音的 base64 编码，不以 base64:// 或者 data:image/jpeg;base64, 开头。
+        """
+        # convert to base64
+        if self.file and self.file.startswith("file:///"):
+            bs64_data = file_to_base64(self.file[8:])
+        elif self.file and self.file.startswith("http"):
+            file_path = await download_image_by_url(self.file)
+            bs64_data = file_to_base64(file_path)
+        elif self.file and self.file.startswith("base64://"):
+            bs64_data = self.file
+        elif os.path.exists(self.file):
+            bs64_data = file_to_base64(self.file)
+        else:
+            raise Exception(f"not a valid file: {self.file}")
+        return bs64_data
 
 
 class Video(BaseMessageComponent):
@@ -272,13 +323,9 @@ class Image(BaseMessageComponent):
     c: T.Optional[int] = 2
     # 额外
     path: T.Optional[str] = ""
-    file_unique: T.Optional[str] = "" # 某些平台可能有图片缓存的唯一标识
+    file_unique: T.Optional[str] = ""  # 某些平台可能有图片缓存的唯一标识
 
     def __init__(self, file: T.Optional[str], **_):
-        # for k in _.keys():
-        #     if (k == "_type" and _[k] not in ["flash", "show", None]) or \
-        #             (k == "c" and _[k] not in [2, 3]):
-        #         logger.warn(f"Protocol: {k}={_[k]} doesn't match values")
         super().__init__(file=file, **_)
 
     @staticmethod
@@ -303,14 +350,75 @@ class Image(BaseMessageComponent):
     def fromIO(IO):
         return Image.fromBytes(IO.read())
 
+    async def convert_to_file_path(self) -> str:
+        """将这个图片统一转换为本地文件路径。这个方法避免了手动判断图片数据类型，直接返回图片数据的本地路径（如果是网络 URL, 则会自动进行下载）。
+
+        Returns:
+            str: 图片的本地路径，以绝对路径表示。
+        """
+        url = self.url if self.url else self.file
+        if url and url.startswith("file:///"):
+            image_file_path = url[8:]
+            return image_file_path
+        elif url and url.startswith("http"):
+            image_file_path = await download_image_by_url(url)
+            return os.path.abspath(image_file_path)
+        elif url and url.startswith("base64://"):
+            bs64_data = url.removeprefix("base64://")
+            image_bytes = base64.b64decode(bs64_data)
+            image_file_path = f"data/temp/{uuid.uuid4()}.jpg"
+            with open(image_file_path, "wb") as f:
+                f.write(image_bytes)
+            return os.path.abspath(image_file_path)
+        elif os.path.exists(url):
+            image_file_path = url
+            return os.path.abspath(image_file_path)
+        else:
+            raise Exception(f"not a valid file: {url}")
+
+    async def convert_to_base64(self) -> str:
+        """将这个图片统一转换为 base64 编码。这个方法避免了手动判断图片数据类型，直接返回图片数据的 base64 编码。
+
+        Returns:
+            str: 图片的 base64 编码，不以 base64:// 或者 data:image/jpeg;base64, 开头。
+        """
+        # convert to base64
+        url = self.url if self.url else self.file
+        if url and url.startswith("file:///"):
+            bs64_data = file_to_base64(url[8:])
+        elif url and url.startswith("http"):
+            image_file_path = await download_image_by_url(url)
+            bs64_data = file_to_base64(image_file_path)
+        elif url and url.startswith("base64://"):
+            bs64_data = url
+        elif os.path.exists(url):
+            bs64_data = file_to_base64(url)
+        else:
+            raise Exception(f"not a valid file: {url}")
+        return bs64_data
+
 
 class Reply(BaseMessageComponent):
     type: ComponentType = "Reply"
     id: T.Union[str, int]
-    text: T.Optional[str] = ""
-    qq: T.Optional[int] = 0
+    """所引用的消息 ID"""
+    chain: T.Optional[T.List["BaseMessageComponent"]] = []
+    """引用的消息段列表"""
+    sender_id: T.Optional[int] | T.Optional[str] = 0
+    """引用的消息发送者 ID"""
+    sender_nickname: T.Optional[str] = ""
+    """引用的消息发送者昵称"""
     time: T.Optional[int] = 0
+    """引用的消息发送时间"""
+    message_str: T.Optional[str] = ""
+    """解析后的纯文本消息字符串"""
+
+    text: T.Optional[str] = ""
+    """deprecated"""
+    qq: T.Optional[int] = 0
+    """deprecated"""
     seq: T.Optional[int] = 0
+    """deprecated"""
 
     def __init__(self, **_):
         super().__init__(**_)
@@ -341,22 +449,30 @@ class Forward(BaseMessageComponent):
     def __init__(self, **_):
         super().__init__(**_)
 
+
 class Node(BaseMessageComponent):
-    '''群合并转发消息'''
+    """群合并转发消息"""
+
     type: ComponentType = "Node"
-    id: T.Optional[int] = 0 # 忽略
-    name: T.Optional[str] = "" # qq昵称
-    uin: T.Optional[int] = 0 # qq号
-    content: T.Optional[T.Union[str, list]] = "" # 子消息段列表
-    seq: T.Optional[T.Union[str, list]] = "" # 忽略
+    id: T.Optional[int] = 0  # 忽略
+    name: T.Optional[str] = ""  # qq昵称
+    uin: T.Optional[int] = 0  # qq号
+    content: T.Optional[T.Union[str, list, dict]] = ""  # 子消息段列表
+    seq: T.Optional[T.Union[str, list]] = ""  # 忽略
     time: T.Optional[int] = 0
 
-    def __init__(self, content: T.Union[str, list], **_):
+    def __init__(self, content: T.Union[str, list, dict, "Node", T.List["Node"]], **_):
         if isinstance(content, list):
-            _content = ""
-            for chain in content:
-                _content += chain.toString()
+            _content = None
+            if all(isinstance(item, Node) for item in content):
+                _content = [node.toDict() for node in content]
+            else:
+                _content = ""
+                for chain in content:
+                    _content += chain.toString()
             content = _content
+        elif isinstance(content, Node):
+            content = content.toDict()
         super().__init__(content=content, **_)
 
     def toString(self):
@@ -364,11 +480,22 @@ class Node(BaseMessageComponent):
         return ""
 
 
+class Nodes(BaseMessageComponent):
+    type: ComponentType = "Nodes"
+    nodes: T.List[Node]
+
+    def __init__(self, nodes: T.List[Node], **_):
+        super().__init__(nodes=nodes, **_)
+
+    def toDict(self):
+        return {"messages": [node.toDict() for node in self.nodes]}
+
+
 class Xml(BaseMessageComponent):
     type: ComponentType = "Xml"
     data: str
     resid: T.Optional[int] = 0
- 
+
     def __init__(self, **_):
         super().__init__(**_)
 
@@ -418,14 +545,16 @@ class Unknown(BaseMessageComponent):
     def toString(self):
         return ""
 
+
 class File(BaseMessageComponent):
-    '''
+    """
     目前此消息段只适配了 Napcat。
-    '''
+    """
+
     type: ComponentType = "File"
-    name: T.Optional[str] = "" # 名字
-    file: T.Optional[str] = "" # url（本地路径）
-    
+    name: T.Optional[str] = ""  # 名字
+    file: T.Optional[str] = ""  # url（本地路径）
+
     def __init__(self, name: str, file: str):
         super().__init__(name=name, file=file)
 
@@ -451,10 +580,11 @@ ComponentTypes = {
     "poke": Poke,
     "forward": Forward,
     "node": Node,
+    "nodes": Nodes,
     "xml": Xml,
     "json": Json,
     "cardimage": CardImage,
     "tts": TTS,
     "unknown": Unknown,
-    'file': File,
+    "file": File,
 }

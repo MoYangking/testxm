@@ -21,14 +21,34 @@ const sidebarItem: menu[] = [
     to: '/dashboard/default'
   },
   {
-    title: '配置文件',
+    title: '消息平台',
+    icon: 'mdi-message-processing',
+    to: '/platforms',
+  },
+  {
+    title: '服务提供商',
+    icon: 'mdi-creation',
+    to: '/providers',
+  },
+  {
+    title: '配置',
     icon: 'mdi-cog',
     to: '/config',
   },
   {
-    title: '插件',
+    title: '插件管理',
     icon: 'mdi-puzzle',
     to: '/extension'
+  },
+  {
+    title: '插件市场',
+    icon: 'mdi-storefront',
+    to: '/extension-marketplace'
+  },
+  {
+    title: '函数调用',
+    icon: 'mdi-function-variant',
+    to: '/tool-use'
   },
   {
     title: '聊天',
