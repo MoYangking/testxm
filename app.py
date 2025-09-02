@@ -92,7 +92,7 @@ def snippet(text: str, limit: int = MAX_DEBUG_BODY_CHARS) -> str:
     return text[:limit] + f"... [truncated {len(text)-limit} chars]"
 
 def sse_data(obj: Any) -> str:
-    """构造 SSE data: ...\\n\\n"""
+    """构造 SSE data: ...\n\n"""
     return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
 
 # ------------------------------------------------------------------------------
@@ -266,16 +266,38 @@ def build_smithery_payload(messages: List[Dict[str, Any]], model_id: str) -> dic
 def _token_estimate(text: str) -> int:
     return max(1, len(text) // 4)
 
-def openai_success_response_from_text(text: str, model: str) -> dict:
+def estimate_usage_for_messages_and_completion(messages: List[Dict[str, Any]], completion_text: str) -> Dict[str, int]:
+    """
+    粗略估算 tokens 用量：
+    - prompt_tokens = 固定 system prompt + 处理后的 messages（剔除原 system，合并进最终 systemPrompt）
+    - completion_tokens = 最终返回给客户端的完整文本（含自动修补后的内容）
+    """
+    try:
+        smithery_messages, final_system_prompt = process_messages_with_system_prompt(messages)
+    except Exception:
+        smithery_messages, final_system_prompt = messages, ""
+    prompt_tokens = _token_estimate(final_system_prompt) + sum(
+        _token_estimate(str(m.get("content", ""))) for m in smithery_messages
+    )
+    completion_tokens = _token_estimate(completion_text or "")
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+def openai_success_response_from_text(text: str, model: str, usage: Optional[Dict[str, int]] = None) -> dict:
     now_ts = int(time.time())
     tokens = _token_estimate(text)
+    if usage is None:
+        usage = {"prompt_tokens": 0, "completion_tokens": tokens, "total_tokens": tokens}
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
         "object": "chat.completion",
         "created": now_ts,
         "model": model,
         "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": tokens, "total_tokens": tokens},
+        "usage": usage,
     }
 
 def _finish_reason_map(src: Optional[str]) -> Optional[str]:
@@ -512,7 +534,11 @@ async def chat_completions(request: Request):
                     logger.error("Non-retry error %s (cookie_fp=%s): %s", resp.status_code, fp, snippet(body_text))
                     if full_content:
                         cleaned = clean_truncated_content(full_content)
-                        return JSONResponse(content=openai_success_response_from_text(cleaned, model_id), status_code=200)
+                        usage = estimate_usage_for_messages_and_completion(openai_req.messages, cleaned)
+                        return JSONResponse(
+                            content=openai_success_response_from_text(cleaned, model_id, usage),
+                            status_code=200,
+                        )
                     raise HTTPException(status_code=resp.status_code, detail=f"upstream error: {body_text}")
 
                 # 成功
@@ -541,7 +567,11 @@ async def chat_completions(request: Request):
             if not used_cookie:
                 if full_content:
                     cleaned = clean_truncated_content(full_content)
-                    return JSONResponse(content=openai_success_response_from_text(cleaned, model_id), status_code=200)
+                    usage = estimate_usage_for_messages_and_completion(openai_req.messages, cleaned)
+                    return JSONResponse(
+                        content=openai_success_response_from_text(cleaned, model_id, usage),
+                        status_code=200,
+                    )
                 # 带调试信息返回
                 err_msg = last_err_text or "unknown error"
                 detail = {"message": f"upstream failed after cookie rotation: {err_msg}", "attempts": attempts}
@@ -562,14 +592,15 @@ async def chat_completions(request: Request):
             continuation_round += 1
 
         full_content = clean_truncated_content(full_content)
-        return JSONResponse(content=openai_success_response_from_text(full_content, model_id), status_code=200)
+        usage = estimate_usage_for_messages_and_completion(openai_req.messages, full_content)
+        return JSONResponse(content=openai_success_response_from_text(full_content, model_id, usage), status_code=200)
 
     # ---------------- 流式：自动续写 ----------------
     async def event_stream_generator():
         created_ts = int(time.time())
         openai_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
-        def make_chunk(delta: Dict[str, Any], finish_reason: Optional[str] = None) -> str:
+        def make_chunk(delta: Dict[str, Any], finish_reason: Optional[str] = None, usage: Optional[Dict[str, int]] = None) -> str:
             obj = {
                 "id": openai_id,
                 "object": "chat.completion.chunk",
@@ -577,6 +608,8 @@ async def chat_completions(request: Request):
                 "model": model_id,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
             }
+            if usage is not None:
+                obj["usage"] = usage
             return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
 
         role_sent = False
@@ -646,10 +679,12 @@ async def chat_completions(request: Request):
                                     extra = cleaned[len(full_content):]
                                     if extra:
                                         yield make_chunk({"content": extra})
-                                yield make_chunk({}, "stop")
+                                usage = estimate_usage_for_messages_and_completion(openai_req.messages, cleaned)
+                                yield make_chunk({}, "stop", usage)
                                 yield "data: [DONE]\n\n"
                             else:
-                                yield make_chunk({"content": f"[upstream error {r.status_code}]"}, "stop")
+                                usage = estimate_usage_for_messages_and_completion(openai_req.messages, "")
+                                yield make_chunk({"content": f"[upstream error {r.status_code}]"}, "stop", usage)
                                 yield "data: [DONE]\n\n"
                             return
 
@@ -713,11 +748,14 @@ async def chat_completions(request: Request):
                                         extra = cleaned[len(full_content):]
                                         if extra:
                                             yield make_chunk({"content": extra})
-                                    yield make_chunk({}, fr)
                                     if not is_continued:
+                                        usage = estimate_usage_for_messages_and_completion(openai_req.messages, cleaned)
+                                        yield make_chunk({}, fr, usage)
                                         yield "data: [DONE]\n\n"
                                         return
-                                    finished = True
+                                    else:
+                                        yield make_chunk({}, fr)
+                                        finished = True
                                 break
 
                             if line.startswith("d:"):
@@ -732,7 +770,8 @@ async def chat_completions(request: Request):
                                         extra = cleaned[len(full_content):]
                                         if extra:
                                             yield make_chunk({"content": extra})
-                                    yield make_chunk({}, fr)
+                                    usage = estimate_usage_for_messages_and_completion(openai_req.messages, cleaned)
+                                    yield make_chunk({}, fr, usage)
                                     yield "data: [DONE]\n\n"
                                     return
                                 break
@@ -744,7 +783,8 @@ async def chat_completions(request: Request):
                                 extra = cleaned[len(full_content):]
                                 if extra:
                                     yield make_chunk({"content": extra})
-                            yield make_chunk({}, "stop")
+                            usage = estimate_usage_for_messages_and_completion(openai_req.messages, cleaned)
+                            yield make_chunk({}, "stop", usage)
                             yield "data: [DONE]\n\n"
                             return
 
@@ -767,7 +807,8 @@ async def chat_completions(request: Request):
                         extra = cleaned[len(full_content):]
                         if extra:
                             yield make_chunk({"content": extra})
-                    yield make_chunk({}, "stop")
+                    usage = estimate_usage_for_messages_and_completion(openai_req.messages, cleaned)
+                    yield make_chunk({}, "stop", usage)
                     yield "data: [DONE]\n\n"
                     return
                 err_msg = last_err or "unknown error"
@@ -781,7 +822,8 @@ async def chat_completions(request: Request):
                     extra = cleaned[len(full_content):]
                     if extra:
                         yield make_chunk({"content": extra})
-                yield make_chunk({}, "stop")
+                usage = estimate_usage_for_messages_and_completion(openai_req.messages, cleaned)
+                yield make_chunk({}, "stop", usage)
                 yield "data: [DONE]\n\n"
                 return
 
@@ -801,7 +843,8 @@ async def chat_completions(request: Request):
             extra = cleaned[len(full_content):]
             if extra:
                 yield make_chunk({"content": extra})
-        yield make_chunk({}, "stop")
+        usage = estimate_usage_for_messages_and_completion(openai_req.messages, cleaned)
+        yield make_chunk({}, "stop", usage)
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
